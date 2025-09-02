@@ -251,7 +251,7 @@ def load_and_prepare_dataset(args, tokenizer):
         text_column = "text"
     elif args.dataset_name == 'BAAI/Infinity-Instruct':
         dataset = load_dataset(args.dataset_name, args.dataset_config, split='train')
-        mapped_dataset = dataset.map(
+        dataset = dataset.map(
             lambda x: _map_conversations_to_chat_template(x, tokenizer, add_generation_prompt=False),
             num_proc=64,
             desc="Formatting conversations",
