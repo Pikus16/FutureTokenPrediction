@@ -48,7 +48,7 @@ class TrainingArguments:
     compile_model: bool = False  # PyTorch 2.0+ compilation
     
     # Data processing
-    max_length: int = 512
+    max_length: int = 2048
     num_workers: int = 8
     preprocessing_num_workers: int = 16
     
@@ -66,7 +66,7 @@ class TrainingArguments:
 class NextNextTokenDataset(Dataset):
     """Dataset for next-next token prediction"""
     
-    def __init__(self, tokenized_texts, max_length=512):
+    def __init__(self, tokenized_texts, max_length=2048):
         self.examples = []
         for tokens in tokenized_texts:
             if len(tokens['input_ids']) > 2:  # Need at least 3 tokens
@@ -250,10 +250,10 @@ def load_and_prepare_dataset(args, tokenizer):
         dataset = load_dataset("rojagtap/bookcorpus", split=f"train[:{sampling_size}]")  # Sample for speed
         text_column = "text"
     elif args.dataset_name == 'BAAI/Infinity-Instruct':
-        dataset = load_dataset(args.dataset_name, args.dataset_config, split='train')
+        dataset = load_dataset(args.dataset_name, args.dataset_config, split='train')#.select(range(100))
         dataset = dataset.map(
             lambda x: _map_conversations_to_chat_template(x, tokenizer, add_generation_prompt=False),
-            num_proc=64,
+            num_proc=args.preprocessing_num_workers,
             desc="Formatting conversations",
             remove_columns=dataset.column_names  # Remove all original columns
         )
@@ -275,7 +275,8 @@ def load_and_prepare_dataset(args, tokenizer):
         tokenize_function,
         batched=True,
         num_proc=args.preprocessing_num_workers,
-        remove_columns=dataset.column_names
+        remove_columns=dataset.column_names,
+        desc="Tokenizing",
     )
     
     return NextNextTokenDataset(tokenized_dataset, args.max_length)
