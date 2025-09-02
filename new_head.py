@@ -14,8 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    get_linear_schedule_with_warmup,
-    DataCollatorForLanguageModeling
+    get_linear_schedule_with_warmup
 )
 from datasets import load_dataset
 import wandb
@@ -23,24 +22,25 @@ from tqdm import tqdm
 import numpy as np
 from accelerate import Accelerator
 from torch.utils.checkpoint import checkpoint
-
+import glob
 
 @dataclass
 class TrainingArguments:
     """Training configuration"""
     model_name: str = "Qwen/Qwen3-4B"
-    dataset_name: str = "rojagtap/bookcorpus"
-    dataset_config: Optional[str] = None
-    output_dir: str = "./next_next_token_model"
+    dataset_name: str = 'BAAI/Infinity-Instruct'
+    dataset_config: Optional[str] = '7M'
+    output_dir: str = "./infinity_next_next_token_model"
     
     # Training hyperparameters
     batch_size: int = 8
     gradient_accumulation_steps: int = 1
     learning_rate: float = 5e-4
     weight_decay: float = 0.01
-    num_epochs: int = 30
+    num_epochs: int = 2
     warmup_steps: int = 500
     max_steps: int = -1
+    save_freq: int = 1
     
     # Optimization
     mixed_precision: str = "bf16"  # "no", "fp16", "bf16"
@@ -61,9 +61,6 @@ class TrainingArguments:
     
     # Misc
     seed: int = 42
-    resume_from_checkpoint: Optional[str] = None
-    push_to_hub: bool = False
-    hub_model_id: Optional[str] = None
 
 
 class NextNextTokenDataset(Dataset):
@@ -204,6 +201,45 @@ def collate_fn(batch):
         'attention_mask': attention_mask
     }
 
+def _map_conversations_to_chat_template(example, tokenizer, add_generation_prompt=False):
+    """
+    Maps the BAAI/Infinity-Instruct conversation format to work with tokenizer.apply_chat_template.
+    
+    Args:
+        example: A single example from the dataset containing 'conversations' field
+        tokenizer: The tokenizer with chat template support
+        add_generation_prompt: Whether to add generation prompt for training
+    
+    Returns:
+        dict: Mapped example with 'text' field containing the formatted conversation
+    """
+    conversations = example['conversations']
+    
+    # Map the conversation format
+    messages = []
+    for turn in conversations:
+        # Map 'human' to 'user' and 'gpt' to 'assistant'
+        if turn['from'] == 'human':
+            role = 'user'
+        elif turn['from'] == 'gpt':
+            role = 'assistant'
+        elif turn['from'] == 'system':
+            role = 'system'
+        else:
+            # Handle any other roles by keeping them as is
+            raise ValueError(f'Unknown role: {role}')
+        
+        messages.append({
+            'role': role,
+            'content': turn['value']
+        })
+    
+    formatted_text = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=add_generation_prompt
+    )
+    return {'text': formatted_text}
 
 def load_and_prepare_dataset(args, tokenizer):
     """Load and tokenize the dataset"""
@@ -213,6 +249,15 @@ def load_and_prepare_dataset(args, tokenizer):
     if args.dataset_name == "rojagtap/bookcorpus":
         dataset = load_dataset("rojagtap/bookcorpus", split=f"train[:{sampling_size}]")  # Sample for speed
         text_column = "text"
+    elif args.dataset_name == 'BAAI/Infinity-Instruct':
+        dataset = load_dataset(args.dataset_name, args.dataset_config, split='train')
+        mapped_dataset = dataset.map(
+            lambda x: _map_conversations_to_chat_template(x, tokenizer, add_generation_prompt=False),
+            num_proc=64,
+            desc="Formatting conversations",
+            remove_columns=dataset.column_names  # Remove all original columns
+        )
+        text_column='text'
     else:
         dataset = load_dataset(args.dataset_name, args.dataset_config, split=f"train[:{sampling_size}]")
         # Assume first text column
@@ -412,10 +457,33 @@ def main():
     # Training loop
     if not os.path.exists(args.output_dir):
         os.mkdir(args.output_dir)
+
+    checkpoints = sorted(glob.glob(os.path.join(args.output_dir, "epoch*.pt")))
+    start_epoch, best_loss = 0, float('inf')
+    if checkpoints:
+        latest_ckpt = checkpoints[-1]
+        print(f"Resuming from checkpoint: {latest_ckpt}")
+        #ckpt = torch.load(latest_ckpt, map_location="cpu")
+        ckpt = torch.load(latest_ckpt, map_location="cpu", weights_only=False)
+
+        # Load lm_head only
+        model.base_model.lm_head.load_state_dict(ckpt['lm_head_state_dict'])
+
+        # Optimizer + scheduler states
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+        # Training state
+        start_epoch = ckpt.get('epoch', 0) + 1
+        best_loss = ckpt.get('best_loss', float('inf'))
+        print(f"Resumed at epoch {start_epoch}, best loss so far {best_loss:.4f}")
+    else:
+        print("No checkpoint found, starting fresh training.")
+
     print("Starting training...")
     best_loss = float('inf')
     
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         print(f"\nEpoch {epoch + 1}/{args.num_epochs}")
         
         # Train
@@ -440,16 +508,17 @@ def main():
                 best_loss = eval_loss
                 print(f"New best model with loss: {best_loss:.4f}")
                 
-            # Save only the lm_head
-            torch.save({
-                'lm_head_state_dict': model.base_model.lm_head.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'epoch': epoch,
-                'best_loss': best_loss,
-                'curr_loss':eval_loss,
-                'args': args
-            }, os.path.join(args.output_dir, f'epoch{epoch}.pt'))
+            if epoch % args.save_steps == 0:
+                # Save only the lm_head
+                torch.save({
+                    'lm_head_state_dict': model.base_model.lm_head.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'best_loss': best_loss,
+                    'curr_loss':eval_loss,
+                    'args': args
+                }, os.path.join(args.output_dir, f'epoch{epoch}.pt'))
     
     # Final save
     if accelerator.is_main_process:
